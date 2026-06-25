@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -19,6 +20,8 @@ from zoneinfo import ZoneInfo
 
 
 DEFAULT_GUIDE_URL = "https://animenosekai.github.io/japanterebi-xmltv/guide.xml"
+DEFAULT_GUIDE_CACHE = "guide.xml"
+DEFAULT_GUIDE_CACHE_MAX_AGE_SECONDS = 6 * 60 * 60
 
 XMLTV_TIME_RE = re.compile(r"^(\d{14})(?:\s*([+-]\d{4}|Z))?$")
 
@@ -46,6 +49,8 @@ class Program:
     title: str
     start: datetime
     stop: datetime | None
+    description: str = ""
+    categories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,6 +162,16 @@ def first_child_text(elem: etree._Element, local_name: str) -> str:
     return ""
 
 
+def child_texts(elem: etree._Element, local_name: str) -> tuple[str, ...]:
+    values: list[str] = []
+    for child in elem:
+        if isinstance(child.tag, str) and etree.QName(child).localname == local_name:
+            text = (child.text or "").strip()
+            if text:
+                values.append(text)
+    return tuple(values)
+
+
 async def fetch_guide(session: aiohttp.ClientSession, url: str) -> bytes:
     headers = {"User-Agent": "xmltv-recording-shift-monitor/1.0"}
     async with session.get(url, headers=headers) as resp:
@@ -164,6 +179,45 @@ async def fetch_guide(session: aiohttp.ClientSession, url: str) -> bytes:
         if resp.status >= 400:
             raise RuntimeError(f"guide fetch failed: HTTP {resp.status}: {body[:200]!r}")
         return body
+
+
+def cache_is_fresh(path: Path, max_age_seconds: int, now: datetime) -> bool:
+    if max_age_seconds < 0 or not path.exists():
+        return False
+    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=now.tzinfo)
+    return now - mtime <= timedelta(seconds=max_age_seconds)
+
+
+async def load_guide(
+    session: aiohttp.ClientSession,
+    url: str,
+    cache_path: Path | None,
+    cache_max_age_seconds: int,
+    now: datetime,
+    force_refresh: bool = False,
+    log: Callable[[str], None] | None = None,
+) -> bytes:
+    if cache_path and not force_refresh and cache_is_fresh(cache_path, cache_max_age_seconds, now):
+        if log:
+            log(f"Using cached guide: {cache_path}")
+        return cache_path.read_bytes()
+
+    try:
+        xml_bytes = await fetch_guide(session, url)
+    except Exception:
+        if cache_path and cache_path.exists():
+            if log:
+                log(f"Guide fetch failed; using cached guide: {cache_path}")
+            return cache_path.read_bytes()
+        raise
+
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(xml_bytes)
+        if log:
+            log(f"Cached guide: {cache_path}")
+
+    return xml_bytes
 
 
 def parse_guide(xml_bytes: bytes, tz: ZoneInfo) -> list[Program]:
@@ -190,6 +244,8 @@ def parse_guide(xml_bytes: bytes, tz: ZoneInfo) -> list[Program]:
 
         channel = elem.get("channel") or ""
         stop_raw = elem.get("stop")
+        description = first_child_text(elem, "desc")
+        categories = child_texts(elem, "category")
 
         try:
             start = parse_xmltv_time(start_raw, tz).astimezone(tz)
@@ -197,7 +253,16 @@ def parse_guide(xml_bytes: bytes, tz: ZoneInfo) -> list[Program]:
         except ValueError:
             continue
 
-        programs.append(Program(channel=channel, title=title, start=start, stop=stop))
+        programs.append(
+            Program(
+                channel=channel,
+                title=title,
+                start=start,
+                stop=stop,
+                description=description,
+                categories=categories,
+            )
+        )
 
     return programs
 
@@ -383,6 +448,47 @@ def detect_changes(
     return alerts
 
 
+def search_programs(
+    programs: list[Program],
+    query: str,
+    match_mode: str = "contains",
+) -> list[Program]:
+    rule = {"title": query, "title_match": match_mode}
+    return sorted(
+        [program for program in programs if title_matches(rule, program.title)],
+        key=lambda program: (program.start, program.channel, program.title),
+    )
+
+
+def format_program_search_results(programs: list[Program], tz: ZoneInfo, limit: int) -> str:
+    if not programs:
+        return "No matching programmes found."
+
+    selected = programs[:limit]
+    lines = [f"Found {len(programs)} matching programme(s); showing {len(selected)}.", ""]
+    for program in selected:
+        local_start = program.start.astimezone(tz)
+        local_stop = program.stop.astimezone(tz) if program.stop else None
+        lines.extend(
+            [
+                program.title,
+                f"  channel: {program.channel}",
+                f"  start: {fmt_dt(local_start)}",
+                f"  stop: {fmt_dt(local_stop) if local_stop else 'unknown'}",
+                f"  recordings.json helper: title={json.dumps(program.title, ensure_ascii=False)}, "
+                f"channel={json.dumps(program.channel, ensure_ascii=False)}, "
+                f"weekday={local_start.strftime('%a').lower()}, time={local_start.strftime('%H:%M')}",
+            ]
+        )
+        if program.categories:
+            lines.append(f"  categories: {', '.join(program.categories)}")
+        if program.description:
+            lines.append(f"  description: {program.description}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
 def prune_state(state: dict[str, Any], now: datetime, retention_days: int) -> None:
     cutoff = now.date() - timedelta(days=retention_days)
     notified = state.setdefault("notified", {})
@@ -485,11 +591,31 @@ async def run(args: argparse.Namespace) -> int:
     guide_url = str(config.get("guide_url", DEFAULT_GUIDE_URL))
     now = datetime.now(tz)
 
+    cache_arg = getattr(args, "guide_cache", None)
+    cache_config = config.get("guide_cache", DEFAULT_GUIDE_CACHE)
+    cache_value = cache_arg if cache_arg is not None else cache_config
+    cache_path = Path(str(cache_value)) if cache_value else None
+    cache_max_age = int(config.get("guide_cache_max_age_seconds", DEFAULT_GUIDE_CACHE_MAX_AGE_SECONDS))
+    if getattr(args, "guide_cache_max_age_seconds", None) is not None:
+        cache_max_age = int(args.guide_cache_max_age_seconds)
+
     timeout = aiohttp.ClientTimeout(total=int(config.get("http_timeout_seconds", 60)))
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        xml_bytes = await fetch_guide(session, guide_url)
+        xml_bytes = await load_guide(
+            session,
+            guide_url,
+            cache_path,
+            cache_max_age,
+            now,
+            force_refresh=bool(getattr(args, "refresh_guide", False)),
+        )
         programs = parse_guide(xml_bytes, tz)
+
+        if getattr(args, "search_title", None):
+            matches = search_programs(programs, args.search_title, args.search_title_match)
+            print(format_program_search_results(matches, tz, int(args.search_limit)))
+            return 0
 
         occurrences = expand_occurrences(config, tz, now)
         new_state = copy.deepcopy(load_json(state_path, {"notified": {}}))
@@ -526,6 +652,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="recordings.json", help="recording schedule JSON")
     parser.add_argument("--state", default="state.json", help="notification state JSON")
     parser.add_argument("--dry-run", action="store_true", help="print Slack message instead of sending")
+    parser.add_argument("--guide-cache", default=None, help="local guide.xml cache path; set config guide_cache to empty to disable")
+    parser.add_argument("--guide-cache-max-age-seconds", type=int, default=None, help="reuse guide cache while it is this fresh")
+    parser.add_argument("--refresh-guide", action="store_true", help="download guide.xml even when the local cache is fresh")
+    parser.add_argument("--search-title", help="search guide.xml by programme title and print recording details")
+    parser.add_argument(
+        "--search-title-match",
+        choices=["exact", "contains", "regex"],
+        default="contains",
+        help="title matching mode for --search-title",
+    )
+    parser.add_argument("--search-limit", type=int, default=25, help="maximum search results to display")
     return parser
 
 

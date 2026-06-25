@@ -1,5 +1,7 @@
 {
   "guide_url": "https://animenosekai.github.io/japanterebi-xmltv/guide.xml",
+  "guide_cache": "guide.xml",
+  "guide_cache_max_age_seconds": 21600,
   "timezone": "Asia/Tokyo",
   "lookahead_days": 14,
   "matching_window_hours": 12,
